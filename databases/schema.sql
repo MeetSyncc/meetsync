@@ -11,7 +11,7 @@ CREATE TABLE users (
     user_id            INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     telegram_user_id   BIGINT  NOT NULL UNIQUE,
     telegram_username  TEXT,                              -- last known @nick, may change
-    timezone           TEXT    NOT NULL DEFAULT 'UTC',    -- IANA name, e.g. 'Europe/Moscow'
+    timezone           TEXT    NOT NULL DEFAULT 'Europe/Moscow', -- IANA time zone name
     basic_privacy_type TEXT    NOT NULL DEFAULT 'open'
         CHECK (basic_privacy_type IN ('open', 'private', 'unavailable')),
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -104,7 +104,24 @@ CREATE TRIGGER trg_participants_updated BEFORE UPDATE ON meeting_participants
 CREATE TABLE user_relations (
     user_id       INTEGER NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
     target_id     INTEGER NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
-    relation_type TEXT CHECK (relation_type IN ('friend', 'blocked')), 
+    relation_type TEXT NOT NULL CHECK (relation_type IN ('friend', 'blocked')),
     PRIMARY KEY (user_id, target_id),
     CHECK (user_id <> target_id)
 );
+
+-- ----------------------------------------------------------- llm_parse_logs
+CREATE TABLE llm_parse_logs (
+    id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id        INTEGER REFERENCES users (user_id) ON DELETE SET NULL,
+    input_text     TEXT NOT NULL,
+    parsed_result  JSONB NOT NULL,
+    is_correct     BOOLEAN,
+    user_timezone  VARCHAR(255) NOT NULL,
+    model_name     VARCHAR(255) NOT NULL,
+    status         VARCHAR(32) NOT NULL
+        CHECK (status IN ('success', 'error', 'needs_clarification')),
+    error_message  TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_llm_parse_logs_user_created
+    ON llm_parse_logs (user_id, created_at);
