@@ -55,7 +55,8 @@ async def find_time_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(Meeting.waiting_participants)
     await message.answer(
-        "Давай подберём время. Выбери способ добавления участников:",
+        "Давай подберём время. Выбери способ добавления участников.\n"
+        "Указывай Telegram username через @.",
         reply_markup=participants_keyboard,
     )
 

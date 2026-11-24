@@ -1,11 +1,10 @@
 
 import re
-from datetime import date, datetime
-
+from datetime import date, datetime, timedelta
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
-
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from states.state import Meeting
+from services.database import get_connection, ensure_user, create_meeting
 from keyboards.keyboards import make_inline, slots_keyboard
 
 
@@ -76,7 +75,7 @@ def period_minutes(start, end):
 
 async def find_common_times(meeting_data):
     """
-    Заглушка для будущего поиска в PostgreSQL.
+    Ищет общие свободные интервалы участников по данным PostgreSQL.
 
     Ожидаемый формат результата:
     [
@@ -86,7 +85,9 @@ async def find_common_times(meeting_data):
         }
     ]
     """
-    return []
+    from services.meeting_search import find_common_times as search_common_times
+
+    return search_common_times(meeting_data)
 
 
 def filter_future_slots(slots):
@@ -195,9 +196,82 @@ async def validate_and_search(message: Message, state: FSMContext, duration: int
     )
 
 
-async def send_invitations(meeting_data):
-    """
-    Заглушка для будущей отправки приглашений через Telegram.
-    Потребуются chat_id участников и подключение PostgreSQL.
-    """
-    return False
+async def send_invitations(
+    meeting_data,
+    bot,
+    creator_telegram_user_id,
+    creator_username=None,
+):
+    """Создаёт встречу в БД и отправляет приглашения."""
+
+    participants = meeting_data.get("participants", [])
+    selected_slot = meeting_data.get("selected_slot")
+    duration = meeting_data.get("duration")
+
+    if not participants or not selected_slot or not duration:
+        return False
+
+    try:
+        start = datetime.fromisoformat(selected_slot["start"])
+
+        meeting = create_meeting(
+            creator_telegram_id=creator_telegram_user_id,
+            creator_username=creator_username,
+            participants=participants,
+            start_datetime=start,
+            duration=duration,
+        )
+
+        meeting_id = meeting["meeting_id"]
+        end = start + timedelta(minutes=duration)
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Принять",
+                        callback_data=f"meeting:accept:{meeting_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Отклонить",
+                        callback_data=f"meeting:decline:{meeting_id}",
+                    ),
+                ]
+            ]
+        )
+
+        message_text = (
+            "📅 Приглашение на встречу!\n\n"
+            f"Дата: {start:%d.%m.%Y}\n"
+            f"Время: {start:%H:%M}–{end:%H:%M}\n"
+            f"Длительность: {duration} минут\n"
+            f"Номер встречи: {meeting_id}\n\n"
+            "Подтверди своё участие:"
+        )
+
+        sent = 0
+
+        for user in meeting["invitees"]:
+            try:
+                await bot.send_message(
+                    chat_id=user["telegram_user_id"],
+                    text=message_text,
+                    reply_markup=keyboard,
+                )
+                sent += 1
+
+            except Exception as exc:
+                print(
+                    f"Не удалось отправить приглашение "
+                    f"{user['telegram_username']}: {exc}"
+                )
+
+        return {
+            "meeting_id": meeting_id,
+            "sent": sent,
+            "total": len(meeting["invitees"]),
+        }
+
+    except Exception as exc:
+        print(f"Ошибка создания встречи: {exc}")
+        return False

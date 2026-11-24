@@ -1,14 +1,10 @@
-
 from __future__ import annotations
-
 import logging
 from contextlib import contextmanager
 from typing import Any, Generator, Optional
 from datetime import time
-
 import psycopg
 from psycopg.rows import dict_row
-
 from config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
@@ -332,3 +328,209 @@ def healthcheck() -> bool:
     except Exception as exc:
         logger.error("DB healthcheck failed: %s", exc)
         return False
+
+
+def create_meeting(
+    creator_telegram_id: int,
+    creator_username: str | None,
+    participants: list[str],
+    start_datetime,
+    duration: int,
+) -> dict:
+    """
+    Создаёт встречу и добавляет её участников.
+    Возвращает ID встречи и список приглашённых пользователей.
+    """
+
+    usernames = list({
+        name.lstrip("@").strip().lower()
+        for name in participants
+        if name.strip()
+    })
+
+    if not usernames:
+        raise ValueError("Список участников пуст.")
+
+    with get_connection() as conn:
+        creator_id = _ensure_user(
+            conn,
+            creator_telegram_id,
+            creator_username,
+            "Europe/Moscow",
+        )
+
+        creator = conn.execute(
+            """
+            SELECT timezone
+            FROM users
+            WHERE user_id = %s
+            """,
+            (creator_id,),
+        ).fetchone()
+
+        from zoneinfo import ZoneInfo
+
+        if start_datetime.tzinfo is None:
+            start_datetime = start_datetime.replace(
+                tzinfo=ZoneInfo(creator["timezone"])
+            )
+
+        rows = conn.execute(
+            """
+            SELECT user_id, telegram_user_id, telegram_username
+            FROM users
+            WHERE LOWER(telegram_username) = ANY(%s)
+            """,
+            (usernames,),
+        ).fetchall()
+
+        found = {
+            row["telegram_username"].lower(): row
+            for row in rows
+            if row["telegram_username"]
+        }
+
+        if len(found) != len(usernames):
+            missing = set(usernames) - set(found)
+            raise ValueError(
+                "Не зарегистрированы в боте: "
+                + ", ".join("@" + name for name in missing)
+            )
+
+        # Создаём встречу.
+        meeting = conn.execute(
+            """
+            INSERT INTO meetings (
+                created_by,
+                status,
+                start_datetime,
+                duration_minutes
+            )
+            VALUES (%s, 'proposed', %s, %s)
+            RETURNING meeting_id
+            """,
+            (creator_id, start_datetime, duration),
+        ).fetchone()
+
+        meeting_id = meeting["meeting_id"]
+
+        # Организатор автоматически подтверждает участие.
+        conn.execute(
+            """
+            INSERT INTO meeting_participants (
+                meeting_id,
+                user_id,
+                status
+            )
+            VALUES (%s, %s, 'accepted')
+            """,
+            (meeting_id, creator_id),
+        )
+
+        # Добавляем остальных участников.
+        invitees = []
+
+        for user in found.values():
+            if user["user_id"] == creator_id:
+                continue
+
+            conn.execute(
+                """
+                INSERT INTO meeting_participants (
+                    meeting_id,
+                    user_id,
+                    status
+                )
+                VALUES (%s, %s, 'invited')
+                ON CONFLICT (meeting_id, user_id) DO NOTHING
+                """,
+                (meeting_id, user["user_id"]),
+            )
+
+            invitees.append(user)
+
+        return {
+            "meeting_id": meeting_id,
+            "invitees": invitees,
+            "creator_telegram_id": creator_telegram_id,
+        }
+
+
+def respond_to_meeting_invitation(
+    meeting_id: int,
+    telegram_user_id: int,
+    response: str,
+) -> dict | None:
+    """
+    Сохраняет ответ участника.
+    response: accepted или declined.
+    """
+
+    if response not in ("accepted", "declined"):
+        raise ValueError("Некорректный ответ.")
+
+    with get_connection() as conn:
+        result = conn.execute(
+            """
+            UPDATE meeting_participants mp
+            SET status = %s
+            FROM users u
+            WHERE mp.user_id = u.user_id
+              AND mp.meeting_id = %s
+              AND u.telegram_user_id = %s
+              AND mp.status = 'invited'
+            RETURNING mp.meeting_id
+            """,
+            (response, meeting_id, telegram_user_id),
+        ).fetchone()
+
+        if not result:
+            return None
+
+        meeting = conn.execute(
+            """
+            SELECT
+                m.meeting_id,
+                m.status,
+                m.created_by,
+                u.telegram_user_id AS creator_telegram_id
+            FROM meetings m
+            JOIN users u ON u.user_id = m.created_by
+            WHERE m.meeting_id = %s
+            """,
+            (meeting_id,),
+        ).fetchone()
+
+        if not meeting:
+            return None
+
+        if response == "accepted":
+            remaining = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM meeting_participants
+                WHERE meeting_id = %s
+                  AND is_required = TRUE
+                  AND status <> 'accepted'
+                """,
+                (meeting_id,),
+            ).fetchone()
+
+            if remaining["count"] == 0:
+                conn.execute(
+                    """
+                    UPDATE meetings
+                    SET status = 'confirmed'
+                    WHERE meeting_id = %s
+                      AND status = 'proposed'
+                    """,
+                    (meeting_id,),
+                )
+                meeting["status"] = "confirmed"
+
+        return {
+            "meeting_id": meeting_id,
+            "response": response,
+            "creator_telegram_id": meeting["creator_telegram_id"],
+            "status": meeting["status"],
+        }

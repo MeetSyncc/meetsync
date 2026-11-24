@@ -2,6 +2,7 @@
 from datetime import date, time, timedelta, datetime
 
 from aiogram import Router, F
+from services.database import respond_to_meeting_invitation
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 
@@ -371,15 +372,116 @@ async def send_invites(callback: CallbackQuery, state: FSMContext):
         await state.set_state(Meeting.choosing_slot)
         return
 
-    if not await send_invitations(data):
+    result = await send_invitations(
+        data,
+        callback.bot,
+        callback.from_user.id,
+        callback.from_user.username,
+    )
+
+    if not result:
         await callback.message.answer(
-            "Отправка приглашений пока не подключена: "
-            "сначала нужны chat_id участников и PostgreSQL."
+            "Не удалось создать встречу или отправить приглашения."
         )
         return
 
     await callback.message.answer(
-        "Приглашения отправлены. Ожидаем ответы.",
+        f"Встреча №{result['meeting_id']} создана.\n"
+        f"Отправлено приглашений: "
+        f"{result['sent']} из {result['total']}.\n\n"
+        "Ожидаем ответы участников.",
         reply_markup=main_menu,
     )
+
     await state.clear()
+
+
+@router.callback_query(F.data.startswith("meeting:accept:"))
+async def accept_meeting(callback: CallbackQuery):
+    try:
+        meeting_id = int(callback.data.split(":")[2])
+
+        result = respond_to_meeting_invitation(
+            meeting_id,
+            callback.from_user.id,
+            "accepted",
+        )
+
+        if not result:
+            await callback.answer(
+                "Приглашение не найдено или ответ уже отправлен.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer("Участие подтверждено!")
+
+        await callback.message.edit_reply_markup(
+            reply_markup=None
+        )
+
+        await callback.message.answer(
+            "✅ Ты принял приглашение на встречу."
+        )
+
+        if result["status"] == "confirmed":
+            await callback.bot.send_message(
+                result["creator_telegram_id"],
+                f"🎉 Все участники приняли приглашение!\n"
+                f"Встреча №{meeting_id} подтверждена.",
+            )
+        else:
+            await callback.bot.send_message(
+                result["creator_telegram_id"],
+                f"✅ Участник @{callback.from_user.username or 'пользователь'} "
+                f"принял приглашение на встречу №{meeting_id}.",
+            )
+
+    except Exception as exc:
+        print(f"Ошибка принятия приглашения: {exc}")
+        await callback.answer(
+            "Не удалось обработать ответ.",
+            show_alert=True,
+        )
+
+
+@router.callback_query(F.data.startswith("meeting:decline:"))
+async def decline_meeting(callback: CallbackQuery):
+    try:
+        meeting_id = int(callback.data.split(":")[2])
+
+        result = respond_to_meeting_invitation(
+            meeting_id,
+            callback.from_user.id,
+            "declined",
+        )
+
+        if not result:
+            await callback.answer(
+                "Приглашение не найдено или ответ уже отправлен.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer("Приглашение отклонено.")
+
+        await callback.message.edit_reply_markup(
+            reply_markup=None
+        )
+
+        await callback.message.answer(
+            "❌ Ты отклонил приглашение."
+        )
+
+        await callback.bot.send_message(
+            result["creator_telegram_id"],
+            f"❌ Участник @{callback.from_user.username or 'пользователь'} "
+            f"отклонил приглашение на встречу №{meeting_id}.",
+        )
+
+    except Exception as exc:
+        print(f"Ошибка отклонения приглашения: {exc}")
+        await callback.answer(
+            "Не удалось обработать ответ.",
+            show_alert=True,
+        )
