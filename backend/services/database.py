@@ -322,9 +322,7 @@ def healthcheck() -> bool:
     try:
         with get_connection() as conn:
             conn.execute("SELECT 1")
-
         return True
-
     except Exception as exc:
         logger.error("DB healthcheck failed: %s", exc)
         return False
@@ -369,7 +367,6 @@ def create_meeting(
         ).fetchone()
 
         from zoneinfo import ZoneInfo
-
         if start_datetime.tzinfo is None:
             start_datetime = start_datetime.replace(
                 tzinfo=ZoneInfo(creator["timezone"])
@@ -383,13 +380,11 @@ def create_meeting(
             """,
             (usernames,),
         ).fetchall()
-
         found = {
             row["telegram_username"].lower(): row
             for row in rows
             if row["telegram_username"]
         }
-
         if len(found) != len(usernames):
             missing = set(usernames) - set(found)
             raise ValueError(
