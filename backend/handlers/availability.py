@@ -3,7 +3,7 @@ import asyncio
 import logging
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
@@ -226,7 +226,7 @@ async def cancel_availability_cb(
     )
 
 
-@router.message(Command("cancel"))
+@router.message(Command("cancel"), StateFilter(Availability))
 async def cancel_availability_msg(
     message: Message,
     state: FSMContext,
