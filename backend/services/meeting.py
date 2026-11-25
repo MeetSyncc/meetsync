@@ -1,12 +1,16 @@
-
 import re
+import asyncio
+import logging
 from datetime import date, datetime, timedelta
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from states.state import Meeting
-from services.database import get_connection, ensure_user, create_meeting
 from keyboards.keyboards import make_inline, slots_keyboard
-
+from services.meeting_search import find_common_times as search_common_times
+from services.database import create_meeting
+logger = logging.getLogger(__name__)
 
 def parse_date_period(value):
     value = value.strip().replace(" ", "").replace("–", "-")
@@ -74,20 +78,10 @@ def period_minutes(start, end):
 
 
 async def find_common_times(meeting_data):
-    """
-    Ищет общие свободные интервалы участников по данным PostgreSQL.
-
-    Ожидаемый формат результата:
-    [
-        {
-            "start": "2026-11-21T14:00:00",
-            "end": "2026-11-21T15:00:00"
-        }
-    ]
-    """
-    from services.meeting_search import find_common_times as search_common_times
-
-    return search_common_times(meeting_data)
+    return await asyncio.to_thread(
+        search_common_times,
+        meeting_data,
+    )
 
 
 def filter_future_slots(slots):
@@ -113,13 +107,28 @@ def filter_future_slots(slots):
     return result
 
 
-async def validate_and_search(message: Message, state: FSMContext, duration: int):
+async def validate_and_search(
+    message: Message,
+    state: FSMContext,
+    duration: int,
+    initiator_telegram_user_id: int | None = None,
+):
     if not isinstance(duration, int) or duration < 1 or duration > 1440:
         await message.answer("Длительность должна составлять от 1 до 1440 минут.")
         await state.set_state(Meeting.waiting_custom_duration)
         return
 
     data = await state.get_data()
+
+    data["initiator_telegram_user_id"] = (
+            initiator_telegram_user_id or message.from_user.id
+    )
+
+    data["chat_id"] = (
+        message.chat.id
+        if message.chat.type in ("group", "supergroup")
+        else None
+    )
 
     if not data.get("participants"):
         await message.answer("Сначала добавь участников.")
@@ -169,7 +178,39 @@ async def validate_and_search(message: Message, state: FSMContext, duration: int
     await message.answer("Проверяю доступность участников...")
 
     data = await state.get_data()
-    slots = await find_common_times(data)
+
+    data["initiator_telegram_user_id"] = (
+            initiator_telegram_user_id or message.from_user.id
+    )
+
+    data["chat_id"] = (
+        message.chat.id
+        if message.chat.type in ("group", "supergroup")
+        else None
+    )
+
+    try:
+        slots = await find_common_times(data)
+
+    except PermissionError:
+        await message.answer(
+            "Не удалось проверить расписание: у одного или нескольких "
+            "участников нет доступа к просмотру."
+        )
+        return
+
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "Availability search failed"
+        )
+
+        await message.answer(
+            "Не удалось выполнить поиск. Проверь подключение к базе данных."
+        )
+        return
+
     slots = filter_future_slots(slots)
 
     if not slots:
@@ -196,82 +237,122 @@ async def validate_and_search(message: Message, state: FSMContext, duration: int
     )
 
 
+
 async def send_invitations(
     meeting_data,
-    bot,
-    creator_telegram_user_id,
+    bot: Bot,
+    creator_telegram_user_id: int,
     creator_username=None,
 ):
-    """Создаёт встречу в БД и отправляет приглашения."""
+    """Создаёт встречу в БД и отправляет приглашения участникам."""
 
-    participants = meeting_data.get("participants", [])
+    participants = meeting_data.get("participants") or []
     selected_slot = meeting_data.get("selected_slot")
     duration = meeting_data.get("duration")
 
     if not participants or not selected_slot or not duration:
-        return False
+        raise ValueError("Не хватает данных для создания встречи.")
 
     try:
+        duration = int(duration)
+
+        if duration < 1 or duration > 1440:
+            raise ValueError("Некорректная длительность встречи.")
+
         start = datetime.fromisoformat(selected_slot["start"])
+        end = datetime.fromisoformat(selected_slot["end"])
 
-        meeting = create_meeting(
-            creator_telegram_id=creator_telegram_user_id,
-            creator_username=creator_username,
-            participants=participants,
-            start_datetime=start,
-            duration=duration,
-        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Некорректные данные выбранного времени.") from exc
 
-        meeting_id = meeting["meeting_id"]
-        end = start + timedelta(minutes=duration)
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("У времени встречи должен быть указан часовой пояс.")
 
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Принять",
-                        callback_data=f"meeting:accept:{meeting_id}",
-                    ),
-                    InlineKeyboardButton(
-                        text="Отклонить",
-                        callback_data=f"meeting:decline:{meeting_id}",
-                    ),
-                ]
+    if end <= start:
+        raise ValueError("Время окончания должно быть позже начала.")
+
+    actual_duration = int((end - start).total_seconds() // 60)
+
+    if actual_duration != duration:
+        raise ValueError("Длительность выбранного интервала не совпадает с заданной.")
+
+    # Сохраняем встречу в PostgreSQL, не блокируя работу бота.
+    meeting = await asyncio.to_thread(
+        create_meeting,
+        creator_telegram_id=creator_telegram_user_id,
+        creator_username=creator_username,
+        participants=participants,
+        start_datetime=start,
+        duration=duration,
+    )
+
+    if not meeting or not meeting.get("meeting_id"):
+        raise RuntimeError("Не удалось создать встречу в базе данных.")
+
+    meeting_id = meeting["meeting_id"]
+    invitees = meeting.get("invitees", [])
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Принять",
+                    callback_data=f"meeting:accept:{meeting_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Отклонить",
+                    callback_data=f"meeting:decline:{meeting_id}",
+                ),
             ]
-        )
+        ]
+    )
 
-        message_text = (
-            "📅 Приглашение на встречу!\n\n"
-            f"Дата: {start:%d.%m.%Y}\n"
-            f"Время: {start:%H:%M}–{end:%H:%M}\n"
-            f"Длительность: {duration} минут\n"
-            f"Номер встречи: {meeting_id}\n\n"
-            "Подтверди своё участие:"
-        )
+    message_text = (
+        "📅 Приглашение на встречу!\n\n"
+        f"Дата: {start:%d.%m.%Y}\n"
+        f"Время: {start:%H:%M}–{end:%H:%M}\n"
+        f"Длительность: {duration} минут\n"
+        f"Номер встречи: {meeting_id}\n\n"
+        "Подтверди своё участие:"
+    )
 
-        sent = 0
+    sent = []
+    failed = []
 
-        for user in meeting["invitees"]:
-            try:
-                await bot.send_message(
-                    chat_id=user["telegram_user_id"],
-                    text=message_text,
-                    reply_markup=keyboard,
-                )
-                sent += 1
+    for user in invitees:
+        telegram_id = user.get("telegram_user_id")
 
-            except Exception as exc:
-                print(
-                    f"Не удалось отправить приглашение "
-                    f"{user['telegram_username']}: {exc}"
-                )
+        if not telegram_id:
+            failed.append(user.get("telegram_username", "неизвестный пользователь"))
+            continue
 
-        return {
-            "meeting_id": meeting_id,
-            "sent": sent,
-            "total": len(meeting["invitees"]),
-        }
+        try:
+            await bot.send_message(
+                chat_id=telegram_id,
+                text=message_text,
+                reply_markup=keyboard,
+            )
+            sent.append(telegram_id)
 
-    except Exception as exc:
-        print(f"Ошибка создания встречи: {exc}")
-        return False
+        except TelegramAPIError:
+            logger.exception(
+                "Не удалось отправить приглашение пользователю %s",
+                telegram_id,
+            )
+            failed.append(
+                user.get("telegram_username") or str(telegram_id)
+            )
+
+    logger.info(
+        "Meeting %s created. Invitations sent: %s, failed: %s",
+        meeting_id,
+        len(sent),
+        len(failed),
+    )
+
+    return {
+        "meeting_id": meeting_id,
+        "sent": sent,
+        "failed": failed,
+        "total": len(invitees),
+    }

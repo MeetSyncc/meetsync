@@ -62,6 +62,17 @@ async def start_availability(
         "Можно писать как удобно — я разберу."
     )
 
+@router.message(Command("cancel"), StateFilter(Availability))
+async def cancel_availability_msg(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+    await message.answer(
+        "Действие отменено.",
+        reply_markup=main_menu,
+    )
+
 
 @router.message(Availability.waiting_text)
 async def process_availability_text(
