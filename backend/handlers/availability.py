@@ -3,7 +3,7 @@ import asyncio
 import logging
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
@@ -60,6 +60,17 @@ async def start_availability(
         "• вторник и четверг после 17:00\n"
         "• суббота весь день, воскресенье до 15:00\n\n"
         "Можно писать как удобно — я разберу."
+    )
+
+@router.message(Command("cancel"), StateFilter(Availability))
+async def cancel_availability_msg(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+    await message.answer(
+        "Действие отменено.",
+        reply_markup=main_menu,
     )
 
 
@@ -226,7 +237,7 @@ async def cancel_availability_cb(
     )
 
 
-@router.message(Command("cancel"))
+@router.message(Command("cancel"), StateFilter(Availability))
 async def cancel_availability_msg(
     message: Message,
     state: FSMContext,

@@ -1,7 +1,12 @@
+import asyncio
+import logging
+
+from aiogram.exceptions import TelegramAPIError
 
 from datetime import date, time, timedelta, datetime
 
 from aiogram import Router, F
+from services.database import respond_to_meeting_invitation
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 
@@ -20,7 +25,7 @@ from services.meeting import (
 )
 
 router = Router()
-
+logger = logging.getLogger(__name__)
 
 @router.callback_query(F.data == "cancel")
 async def cancel_callback(callback: CallbackQuery, state: FSMContext):
@@ -219,10 +224,11 @@ async def choose_duration(callback: CallbackQuery, state: FSMContext):
         return
 
     await validate_and_search(
-        callback.message,
-        state,
-        int(value),
-    )
+    callback.message,
+    state,
+    int(value),
+    initiator_telegram_user_id=callback.from_user.id,
+)
 
 
 @router.callback_query(F.data == "notfound:period")
@@ -371,15 +377,145 @@ async def send_invites(callback: CallbackQuery, state: FSMContext):
         await state.set_state(Meeting.choosing_slot)
         return
 
-    if not await send_invitations(data):
+    try:
+        result = await send_invitations(
+            data,
+            callback.bot,
+            callback.from_user.id,
+            callback.from_user.username,
+        )
+    except Exception:
+        logger.exception("Ошибка создания встречи")
         await callback.message.answer(
-            "Отправка приглашений пока не подключена: "
-            "сначала нужны chat_id участников и PostgreSQL."
+            "Не удалось создать встречу. Проверь подключение к базе данных."
         )
         return
 
+    if not result:
+        await callback.message.answer(
+            "Не удалось создать встречу."
+        )
+        return
+
+    sent_count = len(result["sent"])
+    failed_count = len(result["failed"])
+
     await callback.message.answer(
-        "Приглашения отправлены. Ожидаем ответы.",
+        f"Встреча №{result['meeting_id']} создана.\n"
+        f"Отправлено приглашений: {sent_count} из {result['total']}.\n"
+        f"Не удалось отправить: {failed_count}.\n\n"
+        "Ожидаем ответы участников.",
         reply_markup=main_menu,
     )
+
     await state.clear()
+
+
+@router.callback_query(F.data.startswith("meeting:accept:"))
+async def accept_meeting(callback: CallbackQuery):
+    try:
+        meeting_id = int(callback.data.split(":")[2])
+
+        result = await asyncio.to_thread(
+            respond_to_meeting_invitation,
+            meeting_id,
+            callback.from_user.id,
+            "accepted",
+        )
+
+    except Exception:
+        logger.exception("Ошибка принятия приглашения")
+        await callback.answer(
+            "Не удалось обработать ответ.",
+            show_alert=True,
+        )
+        return
+
+    if not result:
+        await callback.answer(
+            "Приглашение не найдено или ответ уже отправлен.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("Участие подтверждено!")
+
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
+
+    await callback.message.answer(
+        "✅ Ты принял приглашение на встречу."
+    )
+
+    try:
+        if result["status"] == "confirmed":
+            text = (
+                "🎉 Все участники приняли приглашение!\n"
+                f"Встреча №{meeting_id} подтверждена."
+            )
+        else:
+            text = (
+                f"✅ Участник @{callback.from_user.username or 'пользователь'} "
+                f"принял приглашение на встречу №{meeting_id}."
+            )
+
+        await callback.bot.send_message(
+            result["creator_telegram_id"],
+            text,
+        )
+
+    except TelegramAPIError:
+        logger.exception(
+            "Не удалось уведомить организатора о принятии приглашения"
+        )
+
+
+@router.callback_query(F.data.startswith("meeting:decline:"))
+async def decline_meeting(callback: CallbackQuery):
+    try:
+        meeting_id = int(callback.data.split(":")[2])
+
+        result = await asyncio.to_thread(
+            respond_to_meeting_invitation,
+            meeting_id,
+            callback.from_user.id,
+            "declined",
+        )
+
+    except Exception:
+        logger.exception("Ошибка отклонения приглашения")
+        await callback.answer(
+            "Не удалось обработать ответ.",
+            show_alert=True,
+        )
+        return
+
+    if not result:
+        await callback.answer(
+            "Приглашение не найдено или ответ уже отправлен.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("Приглашение отклонено.")
+
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
+
+    await callback.message.answer(
+        "❌ Ты отклонил приглашение."
+    )
+
+    try:
+        await callback.bot.send_message(
+            result["creator_telegram_id"],
+            f"❌ Участник @{callback.from_user.username or 'пользователь'} "
+            f"отклонил приглашение на встречу №{meeting_id}.",
+        )
+
+    except TelegramAPIError:
+        logger.exception(
+            "Не удалось уведомить организатора об отказе"
+        )
