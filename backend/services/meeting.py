@@ -8,7 +8,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from states.state import Meeting
 from keyboards.keyboards import make_inline, slots_keyboard
-from services.meeting_search import find_common_times as search_common_times
+from services.meeting_search import (
+    AvailabilityDataMissingError,
+    find_common_times as search_common_times,
+)
 from services.database import create_meeting
 logger = logging.getLogger(__name__)
 
@@ -192,6 +195,17 @@ async def validate_and_search(
     try:
         slots = await find_common_times(data)
 
+    except AvailabilityDataMissingError as exc:
+        usernames = ", ".join(
+            "@" + username for username in exc.usernames
+        )
+        await message.answer(
+            "Не хватает данных о доступности у следующих участников: "
+            f"{usernames}.\n\n"
+            "Попроси их заполнить расписание и повтори поиск."
+        )
+        return
+
     except PermissionError:
         await message.answer(
             "Не удалось проверить расписание: у одного или нескольких "
@@ -200,17 +214,11 @@ async def validate_and_search(
         return
 
     except Exception:
-        import logging
-
-        logging.getLogger(__name__).exception(
-            "Availability search failed"
-        )
-
+        logger.exception("Availability search failed")
         await message.answer(
             "Не удалось выполнить поиск. Проверь подключение к базе данных."
         )
         return
-
     slots = filter_future_slots(slots)
 
     if not slots:

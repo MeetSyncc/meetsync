@@ -12,6 +12,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from services.database import get_intervals_by_usernames
 
 
+class AvailabilityDataMissingError(Exception):
+    """Нет данных о доступности одного или нескольких участников."""
+
+    def __init__(self, usernames: list[str]):
+        self.usernames = usernames
+        super().__init__("Не хватает данных о доступности участников.")
+
+
 def _parse_date(value: str | date) -> date:
     if isinstance(value, datetime):
         return value.date()
@@ -111,7 +119,7 @@ def _get_search_windows(
         start = datetime.combine(current, time_start, tzinfo=tz)
 
         end_date = current
-        if time_end <= time_start:
+        if time_end < time_start:
             end_date += timedelta(days=1)
 
         end = datetime.combine(end_date, time_end, tzinfo=tz)
@@ -126,6 +134,18 @@ def _get_search_windows(
     return _merge_intervals(windows)
 
 
+def _has_availability_data(user_data: dict[str, Any]) -> bool:
+    """Проверяет, указал ли пользователь хотя бы один период доступности."""
+
+    if user_data.get("intervals"):
+        return True
+
+    return any(
+        item.get("is_free")
+        for item in user_data.get("exceptions", [])
+    )
+
+
 def _get_participant_availability(
     user_data: dict[str, Any],
     search_start: datetime,
@@ -135,8 +155,14 @@ def _get_participant_availability(
 
     # Формируем регулярные интервалы в часовом поясе участника.
     intervals = []
-    local_start = (search_start - timedelta(days=1)).astimezone(tz).date()
-    local_end = (search_end + timedelta(days=1)).astimezone(tz).date()
+
+    local_start = (
+        search_start - timedelta(days=1)
+    ).astimezone(tz).date()
+
+    local_end = (
+        search_end + timedelta(days=1)
+    ).astimezone(tz).date()
 
     current = local_start
 
@@ -228,10 +254,15 @@ def find_common_times(
     if date_end < date_start:
         return []
 
-    time_start = _parse_time(meeting_data.get("time_start", "00:00"))
-    time_end = _parse_time(meeting_data.get("time_end", "23:59"))
+    time_start = _parse_time(
+        meeting_data.get("time_start", "00:00")
+    )
+    time_end = _parse_time(
+        meeting_data.get("time_end", "23:59")
+    )
 
     # Получаем данные участников и проверяем права доступа.
+    # Добавляем запас по датам для учёта часовых поясов.
     data = get_intervals_by_usernames(
         participants,
         initiator_telegram_user_id=meeting_data.get(
@@ -239,10 +270,12 @@ def find_common_times(
         ),
         chat_id=meeting_data.get("chat_id"),
         range_start=datetime.combine(
-            date_start, time.min, tzinfo=timezone.utc
+            date_start - timedelta(days=2),
+            time.min,
+            tzinfo=timezone.utc,
         ),
         range_end=datetime.combine(
-            date_end + timedelta(days=2),
+            date_end + timedelta(days=3),
             time.min,
             tzinfo=timezone.utc,
         ),
@@ -257,12 +290,28 @@ def find_common_times(
 
     participants_data = data.get("participants", {})
 
+    # Проверяем наличие данных у каждого участника.
+    missing_availability = []
+
     for username in participants:
-        if username not in participants_data:
-            return []
+        participant = participants_data.get(username)
+
+        if participant is None:
+            missing_availability.append(username)
+            continue
+
+        if not _has_availability_data(participant):
+            missing_availability.append(username)
+
+    if missing_availability:
+        raise AvailabilityDataMissingError(
+            missing_availability
+        )
 
     # Введённое время считается временем инициатора.
-    initiator_tz = _get_timezone(data.get("initiator_timezone"))
+    initiator_tz = _get_timezone(
+        data.get("initiator_timezone")
+    )
 
     search_windows = _get_search_windows(
         date_start,
@@ -313,8 +362,12 @@ def find_common_times(
             slot_end = slot_start + timedelta(minutes=duration)
 
             results.append({
-                "start": slot_start.astimezone(initiator_tz).isoformat(),
-                "end": slot_end.astimezone(initiator_tz).isoformat(),
+                "start": slot_start.astimezone(
+                    initiator_tz
+                ).isoformat(),
+                "end": slot_end.astimezone(
+                    initiator_tz
+                ).isoformat(),
             })
 
             slot_start = slot_end
